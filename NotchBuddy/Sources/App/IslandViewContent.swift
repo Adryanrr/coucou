@@ -123,6 +123,8 @@ struct OverviewView: View {
             } else {
                 NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Visual Studio Code.app"))
             }
+        case "integration_orca":
+            OrcaService.openOrca()
         case "integration_resend":
             NSWorkspace.shared.open(URL(string: "https://resend.com/emails")!)
         case "integration_vercel":
@@ -201,15 +203,24 @@ struct ApprovalView: View {
                 AgentWho(task: state.focusTask, label: "needs permission")
                 CodeBlock(text: approval?.command ?? approval?.tool ?? "…")
                 HStack(spacing: 8) {
-                    SecondaryButton("Deny") {
-                        HookServer.shared.sendApprovalDecision("deny")
-                    }
-                    PrimaryButton("Allow") {
-                        HookServer.shared.sendApprovalDecision("allow")
-                    }
-                    if !state.alwaysAllow {
+                    if approval?.sessionId.hasPrefix(OrcaService.approvalPrefix) == true {
+                        // Orca (MVP): approval is answered inside Orca — jump there instead
+                        // of showing Allow/Deny buttons that cannot decide remotely.
+                        SecondaryButton("Dismiss") {
+                            OrcaService.shared.respond(to: .deny)
+                        }
+                        PrimaryButton("Open Orca") {
+                            OrcaService.openOrca()
+                        }
+                    } else {
+                        SecondaryButton("Deny") {
+                            AgentServiceRegistry.shared.approve(.deny)
+                        }
+                        PrimaryButton("Allow") {
+                            AgentServiceRegistry.shared.approve(.allow)
+                        }
                         SecondaryButton("Always") {
-                            HookServer.shared.sendApprovalDecision("always")
+                            AgentServiceRegistry.shared.approve(.alwaysAllow)
                         }
                     }
                 }
@@ -960,14 +971,21 @@ struct IntegrationCardView: View {
     private var isConfigured: Bool {
         switch task.id {
         case "integration_claude":
+            #if APPSTORE
+            // Sandboxed: can't read ~/.claude directly — check install flag set by HookServer
+            return UserDefaults.standard.bool(forKey: "coucouHooksInstalled")
+            #else
             let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/settings.json")
             guard let data = try? Data(contentsOf: url),
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let hooks = json["hooks"] as? [String: Any],
                   let ss = hooks["SessionStart"] as? [[String: Any]] else { return false }
             return ss.contains { ($0["hooks"] as? [[String: Any]])?.contains {
-                ($0["command"] as? String)?.contains("NotchBuddy") == true
+                let cmd = $0["command"] as? String
+                return cmd?.contains("NotchBuddy") == true || cmd?.contains("coucou") == true
             } ?? false }
+            #endif
+        case "integration_orca":    return FileManager.default.fileExists(atPath: AppState.shared.orcaRuntimeFilePath)
         case "integration_resend":  return KeychainStore.shared.get("resend-api-key") != nil
         case "integration_n8n":     return KeychainStore.shared.get("n8n-api-key")    != nil
         case "integration_vercel":  return KeychainStore.shared.get("vercel-token")   != nil
@@ -982,6 +1000,8 @@ struct IntegrationCardView: View {
     private var openURL: URL? {
         switch task.id {
         case "integration_claude":  return nil  // uses terminal button below
+        case "integration_orca":    return NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.stablyai.orca")
+                                     ?? URL(fileURLWithPath: "/Applications/Orca.app")
         case "integration_resend":  return URL(string: "https://resend.com/emails")
         case "integration_n8n":
             if let s = KeychainStore.shared.get("n8n-url") { return URL(string: s) }
@@ -995,9 +1015,10 @@ struct IntegrationCardView: View {
         }
     }
 
-    // VS Code with active session: show ticker layout (same as overview)
+    // VS Code / Orca with an active session: show ticker layout (same as overview)
     private var vsCodeSessionActive: Bool {
-        task.id == "integration_claude" && (task.state != .idle || !task.steps.isEmpty)
+        (task.id == "integration_claude" || task.id == "integration_orca") &&
+        (task.state != .idle || !task.steps.isEmpty)
     }
 
     // n8n with a finished execution: show result row instead of "Open n8n" button
@@ -1079,7 +1100,7 @@ struct IntegrationCardView: View {
                         .foregroundColor(Color(hex: "#F5F6F8"))
                         .lineLimit(1).truncationMode(.tail)
                         .layoutPriority(1)
-                    Text("Claude Code")
+                    Text(task.id == "integration_orca" ? "Orca" : "Claude Code")
                         .font(.system(size: 11))
                         .foregroundColor(Color(hex: "#8E939C"))
                         .lineLimit(1).truncationMode(.tail)
@@ -1129,7 +1150,12 @@ struct IntegrationCardView: View {
                     let dot = stripeErr != nil ? Color(hex: "#F4505E")
                             : isConfigured    ? Color(hex: "#22C55E")
                             :                   Color(hex: "#F4505E")
-                    let label = stripeErr ?? (isConfigured ? "Connected · loading…" : "Key not configured")
+                    let label: String = {
+                        if task.id == "integration_orca" {
+                            return isConfigured ? "Polling every 5 s" : "Orca runtime not found"
+                        }
+                        return stripeErr ?? (isConfigured ? "Connected · loading…" : "Key not configured")
+                    }()
                     Circle().fill(dot).frame(width: 5, height: 5)
                     Text(label)
                         .font(.system(size: 11))

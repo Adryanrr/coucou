@@ -5,25 +5,39 @@ import AppKit
 // MARK: - HookServer
 // Listens on a Unix domain socket for events from nb-hook (Claude Code hooks).
 // Thread-safe: socket I/O on background threads, state updates dispatched to main queue.
+// It is the Claude Code implementation of AgentService: it parses hook payloads and
+// forwards normalized AgentEvent values to AgentEventRouter.
 
 final class HookServer: @unchecked Sendable {
     static let shared = HookServer()
+
+    // MARK: - AgentService state
+    // (conformance declared in the extension below — declaring it on the class would
+    // make Swift isolate the whole type to the main actor, but socket I/O runs on threads)
+
+    let taskID = "integration_claude"
+    let source: AgentSource = .claudeCode
+
+    @MainActor
+    var hasPendingApproval: Bool { pendingApprovalFD >= 0 }
 
     // Support directory paths
     static var supportDir: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("NotchBuddy")
     }
-    static var socketPath: String { supportDir.appendingPathComponent("nb.sock").path }
-    static var hookScriptPath: String {
+    static var socketPath: String {
         #if APPSTORE
-        // Written to ~/.claude/coucou/nb-hook via security-scoped bookmark during hook installation
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/coucou/nb-hook").path
+        // Container home root keeps path ≤ 103 bytes (sun_path limit on macOS is 104 incl. NUL)
+        // /Users/louis/Library/Containers/fr.louisraille.Coucou/Data/nb.sock = 66 bytes ✓
+        return NSHomeDirectory() + "/nb.sock"
         #else
-        return supportDir.appendingPathComponent("nb-hook").path
+        return supportDir.appendingPathComponent("nb.sock").path
         #endif
     }
+    // hookScriptPath is only used by the non-App Store build.
+    // App Store build derives the command from the panel-selected claudeURL in buildHooksData(claudeURL:).
+    static var hookScriptPath: String { supportDir.appendingPathComponent("nb-hook").path }
 
     // No approval blocking state — notch is notification-only, user answers in VS Code
 
@@ -35,7 +49,10 @@ final class HookServer: @unchecked Sendable {
 
     // MARK: - Start
 
+    @MainActor
     func start() {
+        // Ensure support directory exists before socket server tries to bind
+        try? FileManager.default.createDirectory(at: Self.supportDir, withIntermediateDirectories: true)
         #if !APPSTORE
         installHookScript()
         #endif
@@ -46,6 +63,12 @@ final class HookServer: @unchecked Sendable {
 
     private func serverThread() {
         let path = Self.socketPath
+        // sun_path on macOS is 104 bytes including the NUL terminator → max 103 usable bytes
+        let maxSunPathBytes = MemoryLayout<sockaddr_un>.size - MemoryLayout<sa_family_t>.size - 1
+        guard path.utf8.count <= maxSunPathBytes else {
+            NSLog("HookServer: socket path too long (\(path.utf8.count) bytes, max \(maxSunPathBytes)): \(path)")
+            return
+        }
         try? FileManager.default.removeItem(atPath: path)
 
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -107,14 +130,12 @@ final class HookServer: @unchecked Sendable {
     }
 
 
-    // MARK: - Event → AppState
-    // All Claude Code events route to the permanent "integration_claude" task.
-    // View switches only happen if VS Code is the currently focused mochi.
-    // When not focused: state updates animate the mini bot in the pill; badge shown for alerts.
+    // MARK: - Event → AgentEvent
+    // Claude Code hook payloads are parsed here and normalized into AgentEvent.
+    // AppState is only touched by AgentEventRouter (shared with the other providers).
 
     @MainActor
     private func processEvent(name: String, payload: [String: Any]) {
-        let state = AppState.shared
         let sessionId = payload["session_id"] as? String ?? "unknown"
         let cwd = payload["cwd"] as? String ?? ""
         let rawName = URL(fileURLWithPath: cwd).lastPathComponent
@@ -125,127 +146,70 @@ final class HookServer: @unchecked Sendable {
         let isVSCode = termProgram.lowercased().contains("vscode") ||
                        bundleId.lowercased().contains("vscode")
         guard isVSCode else {
-            nbLog("Ignored \(name) from \(termProgram.isEmpty ? bundleId : termProgram) (\(projectName))")
+            agentLog("Ignored \(name) from \(termProgram.isEmpty ? bundleId : termProgram) (\(projectName))")
             return
         }
 
-        let focused = state.focusId == "integration_claude"
+        guard let kind = eventKind(for: name, payload: payload, sessionId: sessionId) else { return }
 
+        AgentEventRouter.shared.handle(
+            AgentEvent(taskID: taskID, projectName: projectName, cwd: cwd, kind: kind)
+        )
+    }
+
+    /// Maps one Claude Code hook event to a normalized AgentEventKind (nil = ignored).
+    @MainActor
+    private func eventKind(for name: String, payload: [String: Any], sessionId: String) -> AgentEventKind? {
         switch name {
 
         case "SessionStart":
             activeSessionId = sessionId
-            upsertTask(projectName: projectName, cwd: cwd)
-            nbLog("SessionStart \(projectName) (\(sessionId.prefix(8)))")
-            if state.isPresent { expandIfNeeded(to: .overview) }
-            SoundEngine.shared.play("work")
+            return .sessionStart
 
         case "UserPromptSubmit":
             activeSessionId = sessionId
-            upsertTask(projectName: projectName, cwd: cwd)
-            state.updateTask(id: "integration_claude", state: .thinking)
-            if let message = payload["message"] as? String, !message.isEmpty {
-                appendStep(id: "integration_claude", step: String(message.prefix(60)))
-            }
-            if state.isPresent { expandIfNeeded(to: .overview) }
+            return .userPrompt(payload["prompt"] as? String)
 
         case "PreToolUse":
             activeSessionId = sessionId
-            upsertTask(projectName: projectName, cwd: cwd)
-            state.updateTask(id: "integration_claude", state: .working)
             let tool = payload["tool_name"] as? String ?? "Tool"
             let input = payload["tool_input"] as? [String: Any] ?? [:]
-            let step = frenchStep(tool: tool, input: input)
-            appendStep(id: "integration_claude", step: step)
-            nbLog("PreToolUse \(step)")
+            return .step(frenchStep(tool: tool, input: input))
 
         case "PostToolUse":
-            state.updateTask(id: "integration_claude", state: .working)
+            return .working
 
         case "PostToolUseFailure":
-            state.updateTask(id: "integration_claude", state: .working)
-            appendStep(id: "integration_claude", step: "⚠ failed")
+            return .stepFailure
 
         case "Notification":
-            let message = payload["message"] as? String ?? ""
-            let lower = message.lowercased()
-            if lower.contains("rate limit") || lower.contains("limite d") {
-                state.updateTask(id: "integration_claude", state: .ratelimit)
-                SoundEngine.shared.play("rate")
-            } else if message.hasSuffix("?") {
-                state.updateTask(id: "integration_claude", state: .question)
-                appendStep(id: "integration_claude", step: message)
-            }
+            return .notification(payload["message"] as? String ?? "")
 
         case "Stop":
-            state.updateTask(id: "integration_claude", state: .finished)
-            if let message = payload["message"] as? String, !message.isEmpty {
-                appendStep(id: "integration_claude", step: String(message.prefix(60)))
-            }
-            SoundEngine.shared.play("finish")
-            if focused {
-                expandIfNeeded(to: .finished)
-            } else {
-                setPillBadge(id: "integration_claude", badge: .finished)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5.2) {
-                state.updateTask(id: "integration_claude", state: .idle)
-                self.clearPillBadge(id: "integration_claude")
-            }
+            return .finished(payload["message"] as? String)
 
         case "StopFailure":
-            state.updateTask(id: "integration_claude", state: .error)
-            SoundEngine.shared.play("error")
-            if focused {
-                expandIfNeeded(to: .error)
-            } else {
-                setPillBadge(id: "integration_claude", badge: .error)
-            }
+            return .failed(nil)
 
         case "SessionEnd":
             activeSessionId = nil
-            state.updateTask(id: "integration_claude", state: .idle)
-            clearSession()
+            return .sessionEnd(resetTo: "VS Code")
 
         case "SubagentStart":
-            appendStep(id: "integration_claude", step: "+ subagent")
+            return .subagentStart
 
         case "SubagentStop":
-            appendStep(id: "integration_claude", step: "• subagent done")
+            return .subagentStop
 
         default:
-            break
+            return nil
         }
-    }
-
-    // MARK: - Helpers
-
-    @MainActor
-    private func expandIfNeeded(to view: IslandView) {
-        let state = AppState.shared
-        let isAlert: Bool
-        switch view {
-        case .approval, .finished, .error, .confused: isAlert = true
-        default: isAlert = false
-        }
-        if state.mode == .expanded {
-            // Only force-switch view for alerts — leave user on their current view otherwise
-            if isAlert { state.view = view }
-        } else if isAlert {
-            // Alerts always force-expand
-            NotificationCenter.default.post(name: .hookExpand, object: view)
-        } else if state.mode == .hidden {
-            // Non-alert work events: reveal compact only, never force-expand
-            NotificationCenter.default.post(name: .hookReveal, object: nil)
-        }
-        // Already compact and non-alert: Mochi state update is enough, no expand
     }
 
     // MARK: - Permission request (blocking — Claude Code waits for decision)
 
     @MainActor
     private func processPermissionRequest(fd: Int32, payload: [String: Any]) {
-        let state = AppState.shared
         let sessionId = payload["session_id"] as? String ?? "unknown"
         let cwd       = payload["cwd"]        as? String ?? ""
         let rawName   = URL(fileURLWithPath: cwd).lastPathComponent
@@ -268,49 +232,54 @@ final class HookServer: @unchecked Sendable {
         if let input = payload["tool_input"] as? [String: Any] {
             command = input["command"] as? String ?? tool
         }
-        nbLog("PermissionRequest \(tool): \(command)")
+        agentLog("PermissionRequest \(tool): \(command)")
 
         if pendingApprovalFD >= 0 {
             let old = pendingApprovalFD
             Task.detached { [weak self] in
-                self?.sendLine(fd: old, text: #"{"permissionDecision":"deny"}"#)
+                // "ask" → nb-hook outputs nothing → Claude Code re-asks
+                self?.sendLine(fd: old, text: #"{"permissionDecision":"ask"}"#)
                 close(old)
             }
         }
         pendingApprovalFD = fd
         activeSessionId = sessionId
 
-        upsertTask(projectName: projectName, cwd: cwd)
-        state.updateTask(id: "integration_claude", state: .approval)
-        state.pendingApproval = ApprovalInfo(sessionId: sessionId, tool: tool, command: command)
-        state.isPinned = true
-        SoundEngine.shared.play("approval")
+        AgentEventRouter.shared.handle(AgentEvent(
+            taskID: taskID,
+            projectName: projectName,
+            cwd: cwd,
+            kind: .permissionRequest(AgentPermissionRequest(sessionID: sessionId,
+                                                            requestID: "",
+                                                            tool: tool,
+                                                            command: command))
+        ))
 
-        let focused = state.focusId == "integration_claude"
-        if focused {
-            expandIfNeeded(to: .approval)
-        } else {
-            setPillBadge(id: "integration_claude", badge: .approval)
-        }
-
+        // Claude Code gives us 120s to answer — hand the decision back to it when nobody decides.
         let captured = fd
         DispatchQueue.main.asyncAfter(deadline: .now() + 115) { [weak self] in
-            guard let self, self.pendingApprovalFD == captured else { return }
-            self.sendApprovalDecision("deny")
+            Task { @MainActor in
+                guard let self, self.pendingApprovalFD == captured else { return }
+                // "ask" → nb-hook outputs nothing → Claude Code re-asks rather than denying
+                self.respond(to: .ask)
+            }
         }
     }
 
-    /// Called by ApprovalView buttons. Writes the decision to the waiting nb-hook and cleans up.
+    // MARK: - AgentService: approval decision
+
+    /// Called by the approval card (via AgentServiceRegistry) and by the timeout above.
     @MainActor
-    func sendApprovalDecision(_ decision: String) {
+    func respond(to decision: AgentApprovalDecision) {
         let fd = pendingApprovalFD
         pendingApprovalFD = -1
 
         let json: String
         switch decision {
-        case "allow":  json = #"{"permissionDecision":"allow"}"#
-        case "always": json = #"{"permissionDecision":"allow","alwaysAllow":true}"#
-        default:       json = #"{"permissionDecision":"deny"}"#
+        case .allow:       json = #"{"permissionDecision":"allow"}"#
+        case .alwaysAllow: json = #"{"permissionDecision":"always"}"#
+        case .ask:         json = #"{"permissionDecision":"ask"}"#
+        case .deny:        json = #"{"permissionDecision":"deny"}"#
         }
 
         if fd >= 0 {
@@ -320,62 +289,12 @@ final class HookServer: @unchecked Sendable {
             }
         }
 
-        let state = AppState.shared
-        if decision == "always" { state.alwaysAllow = true }
-        state.pendingApproval = nil
-        state.isPinned = false
-        state.updateTask(id: "integration_claude", state: .working)
-        clearPillBadge(id: "integration_claude")
-        state.view = state.tasks.isEmpty ? .empty : .overview
-    }
-
-    /// Updates integration_claude with the current session project name and cwd.
-    @MainActor
-    private func upsertTask(projectName: String, cwd: String = "") {
-        let state = AppState.shared
-        guard let idx = state.tasks.firstIndex(where: { $0.id == "integration_claude" }) else { return }
-        state.tasks[idx].name = projectName
-        if !cwd.isEmpty { state.tasks[idx].sessionCwd = cwd }
-    }
-
-    // MARK: - Badge helpers
-
-    @MainActor
-    private func setPillBadge(id: String, badge: PillBadge) {
-        let state = AppState.shared
-        guard let idx = state.tasks.firstIndex(where: { $0.id == id }) else { return }
-        state.tasks[idx].pillBadge = badge
-    }
-
-    @MainActor
-    private func clearPillBadge(id: String) {
-        let state = AppState.shared
-        guard let idx = state.tasks.firstIndex(where: { $0.id == id }) else { return }
-        state.tasks[idx].pillBadge = nil
-    }
-
-    /// Resets integration_claude to idle, clears steps and project name.
-    @MainActor
-    private func clearSession() {
-        let state = AppState.shared
-        guard let idx = state.tasks.firstIndex(where: { $0.id == "integration_claude" }) else { return }
-        state.tasks[idx].steps = []
-        state.tasks[idx].stepIndex = 0
-        state.tasks[idx].name = "VS Code"
-        state.tasks[idx].pillBadge = nil
-    }
-
-    @MainActor
-    private func appendStep(id: String, step: String) {
-        let state = AppState.shared
-        guard let idx = state.tasks.firstIndex(where: { $0.id == id }) else { return }
-        state.tasks[idx].steps.append(step)
-        if state.tasks[idx].steps.count > 20 { state.tasks[idx].steps.removeFirst() }
-        state.tasks[idx].stepIndex = state.tasks[idx].steps.count - 1
+        AgentEventRouter.shared.handle(
+            AgentEvent(taskID: taskID, kind: .permissionResolved(decision))
+        )
     }
 
     // MARK: - Project name alias mapping
-
     private func aliasProjectName(_ name: String) -> String {
         let aliases: [String: String] = [
             "notch-buddy":  "Notch Buddy",
@@ -417,35 +336,15 @@ final class HookServer: @unchecked Sendable {
         return label
     }
 
-    // MARK: - Logging
-
-    private func nbLog(_ message: String) {
-        let logsDir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Logs/NotchBuddy")
-        try? FileManager.default.createDirectory(at: logsDir, withIntermediateDirectories: true)
-        let logFile = logsDir.appendingPathComponent("nb.log")
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        let line = "\(formatter.string(from: Date())) \(message)\n"
-        guard let data = line.data(using: .utf8) else { return }
-        if FileManager.default.fileExists(atPath: logFile.path) {
-            if let handle = try? FileHandle(forWritingTo: logFile) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                try? handle.close()
-            }
-        } else {
-            try? data.write(to: logFile)
-        }
-    }
-
     private func sendLine(fd: Int32, text: String) {
-        var bytes = Array((text + "\n").utf8)
-        var sent = 0
-        while sent < bytes.count {
-            let n = Darwin.send(fd, &bytes[sent], bytes.count - sent, 0)
-            if n <= 0 { break }
-            sent += n
+        let bytes = Array((text + "\n").utf8)
+        bytes.withUnsafeBytes { buffer in
+            var sent = 0
+            while sent < buffer.count {
+                let n = Darwin.send(fd, buffer.baseAddress! + sent, buffer.count - sent, 0)
+                if n <= 0 { break }
+                sent += n
+            }
         }
     }
 
@@ -454,17 +353,46 @@ final class HookServer: @unchecked Sendable {
     func installHookScript() {
         #if APPSTORE
         // In App Store mode the script is written during settings hook installation
-        // (requires a security-scoped bookmark to ~/.claude chosen by the user)
+        // (requires NSOpenPanel to ~/.claude chosen by the user)
         #else
         let dir = Self.supportDir
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let scriptURL = URL(fileURLWithPath: Self.hookScriptPath)
-        try? nbHookScript.write(to: scriptURL, atomically: true, encoding: .utf8)
-        _ = try? FileManager.default.setAttributes(
-            [.posixPermissions: 0o755 as NSNumber],
-            ofItemAtPath: scriptURL.path
-        )
+        // nb-hook: shell wrapper (always exits 0, calls nb-hook.py via python3)
+        let wrapperURL = URL(fileURLWithPath: Self.hookScriptPath)
+        try? nbHookShellWrapper.write(to: wrapperURL, atomically: true, encoding: .utf8)
+        _ = try? FileManager.default.setAttributes([.posixPermissions: 0o755 as NSNumber], ofItemAtPath: wrapperURL.path)
+        // nb-hook.py: Python relay
+        let pyURL = wrapperURL.deletingLastPathComponent().appendingPathComponent("nb-hook.py")
+        try? nbHookPythonGitHub.write(to: pyURL, atomically: true, encoding: .utf8)
+        _ = try? FileManager.default.setAttributes([.posixPermissions: 0o755 as NSNumber], ofItemAtPath: pyURL.path)
         #endif
+    }
+
+    // MARK: - Outdated hook detection
+
+    /// Returns true if settings.json has a Coucou PermissionRequest hook with timeout < 120s.
+    static func hooksNeedUpdate() -> Bool {
+        let settingsURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/settings.json")
+        guard let data = try? Data(contentsOf: settingsURL),
+              let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let hooks = settings["hooks"] as? [String: Any],
+              let permReqHooks = hooks["PermissionRequest"] as? [[String: Any]] else {
+            return false
+        }
+        for matcher in permReqHooks {
+            if let hookList = matcher["hooks"] as? [[String: Any]] {
+                for hook in hookList {
+                    if let cmd = hook["command"] as? String,
+                       (cmd.contains("NotchBuddy") || cmd.contains("coucou")),
+                       let timeout = hook["timeout"] as? Int,
+                       timeout < 120 {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
     }
 
     // MARK: - Claude Code settings.json hook installer
@@ -515,7 +443,7 @@ final class HookServer: @unchecked Sendable {
             ("SessionStart", 10), ("SessionEnd", 10),
             ("UserPromptSubmit", 10),
             ("PreToolUse", 10), ("PostToolUse", 10), ("PostToolUseFailure", 10),
-            ("PermissionRequest", 10),
+            ("PermissionRequest", 120),
             ("Notification", 10),
             ("Stop", 10), ("StopFailure", 10),
             ("SubagentStart", 10), ("SubagentStop", 10),
@@ -558,26 +486,20 @@ final class HookServer: @unchecked Sendable {
     // MARK: - App Store: hooks via security-scoped bookmark
 
     #if APPSTORE
-    /// App Store variant — needs a security-scoped bookmark URL pointing to ~/.claude
-    func previewClaudeHooksAppStore(claudeURL: URL) throws -> String {
-        let accessing = claudeURL.startAccessingSecurityScopedResource()
-        defer { if accessing { claudeURL.stopAccessingSecurityScopedResource() } }
+    /// Writes nb-hook script and updates settings.json in one shot.
+    /// claudeURL must be a URL from NSOpenPanel (sandbox access is granted immediately — no security scope needed).
+    func installAndWriteClaudeHooksAppStore(claudeURL: URL) throws {
         let data = try buildHooksData(claudeURL: claudeURL)
-        _pendingHooksData = data
-        return String(data: data, encoding: .utf8) ?? ""
-    }
 
-    func writeClaudeHooksAppStore(claudeURL: URL) throws {
-        guard let data = _pendingHooksData else { return }
-        let accessing = claudeURL.startAccessingSecurityScopedResource()
-        defer { if accessing { claudeURL.stopAccessingSecurityScopedResource() } }
-
-        // Write the nb-hook script into ~/.claude/coucou/nb-hook
+        // Write nb-hook (shell wrapper) + nb-hook.py (Python relay) into ~/.claude/coucou/
         let coucouDir = claudeURL.appendingPathComponent("coucou")
         try FileManager.default.createDirectory(at: coucouDir, withIntermediateDirectories: true)
-        let scriptURL = coucouDir.appendingPathComponent("nb-hook")
-        try nbHookScriptAppStore.write(to: scriptURL, atomically: true, encoding: .utf8)
-        _ = try? FileManager.default.setAttributes([.posixPermissions: 0o755 as NSNumber], ofItemAtPath: scriptURL.path)
+        let wrapperURL = coucouDir.appendingPathComponent("nb-hook")
+        try nbHookShellWrapper.write(to: wrapperURL, atomically: true, encoding: .utf8)
+        _ = try? FileManager.default.setAttributes([.posixPermissions: 0o755 as NSNumber], ofItemAtPath: wrapperURL.path)
+        let pyURL = coucouDir.appendingPathComponent("nb-hook.py")
+        try nbHookPythonAppStore.write(to: pyURL, atomically: true, encoding: .utf8)
+        _ = try? FileManager.default.setAttributes([.posixPermissions: 0o755 as NSNumber], ofItemAtPath: pyURL.path)
 
         // Write settings.json (with backup)
         let settingsURL = claudeURL.appendingPathComponent("settings.json")
@@ -586,12 +508,10 @@ final class HookServer: @unchecked Sendable {
         let backupURL = claudeURL.appendingPathComponent("settings.json.bak-\(formatter.string(from: Date()))")
         try? FileManager.default.copyItem(at: settingsURL, to: backupURL)
         try data.write(to: settingsURL, options: .atomic)
-        _pendingHooksData = nil
+        UserDefaults.standard.set(true, forKey: "coucouHooksInstalled")
     }
 
     func uninstallClaudeHooksAppStore(claudeURL: URL) throws {
-        let accessing = claudeURL.startAccessingSecurityScopedResource()
-        defer { if accessing { claudeURL.stopAccessingSecurityScopedResource() } }
         let settingsURL = claudeURL.appendingPathComponent("settings.json")
         guard let data = try? Data(contentsOf: settingsURL),
               var settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -611,6 +531,7 @@ final class HookServer: @unchecked Sendable {
         settings["hooks"] = hooks
         let newData = try JSONSerialization.data(withJSONObject: settings, options: [.prettyPrinted, .sortedKeys])
         try newData.write(to: settingsURL, options: .atomic)
+        UserDefaults.standard.set(false, forKey: "coucouHooksInstalled")
     }
 
     private func buildHooksData(claudeURL: URL) throws -> Data {
@@ -620,13 +541,14 @@ final class HookServer: @unchecked Sendable {
            let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             settings = parsed
         }
-        let hookPath = Self.hookScriptPath
+        // Derive hook path from the panel-selected claudeURL (real ~/.claude, not container)
+        let hookPath = claudeURL.appendingPathComponent("coucou/nb-hook").path
         let quotedCmd = "/bin/sh \"\(hookPath.replacingOccurrences(of: "\"", with: "\\\""))\""
         let events: [(String, Int)] = [
             ("SessionStart", 10), ("SessionEnd", 10),
             ("UserPromptSubmit", 10),
             ("PreToolUse", 10), ("PostToolUse", 10), ("PostToolUseFailure", 10),
-            ("PermissionRequest", 10),
+            ("PermissionRequest", 120),
             ("Notification", 10),
             ("Stop", 10), ("StopFailure", 10),
             ("SubagentStart", 10), ("SubagentStop", 10),
@@ -647,18 +569,43 @@ final class HookServer: @unchecked Sendable {
     #endif
 }
 
+// MARK: - AgentService conformance
+// Declared here (not on the class) so socket I/O stays non-isolated.
+
+extension HookServer: AgentService {}
+
 // MARK: - Notification names for hook server → controller communication
 
 extension Notification.Name {
     static let hookExpand = Notification.Name("notchBuddy.hookExpand")
 }
 
-// MARK: - nb-hook Python script content
+// MARK: - nb-hook shell wrapper (same for both GitHub and App Store)
+// Invoked by Claude Code via /bin/sh or directly via shebang.
+// Always exits 0 — never blocks Claude Code.
+// Checks xcode-select before running python3 to avoid triggering the
+// "install developer tools" dialog on machines without Xcode CLI tools.
 
-private let nbHookScript = """
+private let nbHookShellWrapper = """
+#!/bin/sh
+# Coucou hook relay — always exits 0, never blocks Claude Code
+HOOK_DIR="$(dirname "$0")"
+if xcode-select -p >/dev/null 2>&1; then
+    out=$(/usr/bin/python3 "$HOOK_DIR/nb-hook.py" 2>/dev/null)
+    rc=$?
+    if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
+        printf '%s\\n' "$out"
+    fi
+fi
+exit 0
+"""
+
+// MARK: - nb-hook Python relay (GitHub / non-sandboxed version)
+
+private let nbHookPythonGitHub = """
 #!/usr/bin/env python3
-# nb-hook — Notch Buddy hook relay for Claude Code
-# Reads JSON from stdin, forwards to NotchBuddy via Unix socket, relays response.
+# nb-hook.py — Coucou hook relay for Claude Code (GitHub version)
+# Reads JSON from stdin, forwards to Coucou via Unix socket, translates response.
 import sys, json, os, socket
 
 def main():
@@ -685,7 +632,7 @@ def main():
     )
 
     if event == 'PermissionRequest':
-        # Block and wait for NotchBuddy's decision (Claude Code allows up to 120s)
+        # Block and wait for Coucou's decision (Claude Code allows up to 120s)
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(118)
@@ -701,15 +648,34 @@ def main():
                     break
             s.close()
             response = b''.join(chunks).decode().strip()
-            if response and 'permissionDecision' in response:
-                sys.stdout.write(response + '\\n')
-                sys.stdout.flush()
-                sys.exit(0)
+            if response:
+                try:
+                    resp_obj = json.loads(response)
+                    decision = resp_obj.get('permissionDecision', '')
+                except Exception:
+                    decision = ''
+                if decision == 'allow':
+                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow'}}}
+                    sys.stdout.write(json.dumps(out) + '\\n')
+                    sys.stdout.flush()
+                    sys.exit(0)
+                elif decision == 'always':
+                    # Let Claude Code persist the rule via updatedPermissions
+                    suggestions = payload.get('permission_suggestions', [])
+                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow', 'updatedPermissions': suggestions}}}
+                    sys.stdout.write(json.dumps(out) + '\\n')
+                    sys.stdout.flush()
+                    sys.exit(0)
+                elif decision == 'deny':
+                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'deny', 'message': 'Denied from Coucou'}}}
+                    sys.stdout.write(json.dumps(out) + '\\n')
+                    sys.stdout.flush()
+                    sys.exit(0)
+                # 'ask' or unknown: fall through → no output → Claude Code re-asks
         except Exception:
             pass
-        # Fallback: deny if NotchBuddy unreachable or timeout
-        sys.stdout.write('{"permissionDecision":"deny"}\\n')
-        sys.stdout.flush()
+        # App unreachable, timed out, or no explicit decision — print nothing
+        # Claude Code will handle the absence of output (re-ask or default behaviour)
         sys.exit(0)
 
     # All other events: fire-and-forget (0.3s timeout, never blocks)
@@ -726,11 +692,12 @@ main()
 sys.exit(0)
 """
 
-// MARK: - nb-hook script for App Store (socket in sandboxed container)
+// MARK: - nb-hook Python relay (App Store — socket in sandboxed container)
 
-private let nbHookScriptAppStore = """
+private let nbHookPythonAppStore = """
 #!/usr/bin/env python3
-# nb-hook — Notch Buddy (App Store) hook relay for Claude Code
+# nb-hook.py — Coucou (App Store) hook relay for Claude Code
+# Socket lives inside the sandboxed container; script runs outside the sandbox.
 import sys, json, os, socket
 
 def main():
@@ -751,12 +718,12 @@ def main():
         payload['cwd'] = os.getcwd()
 
     event = payload.get('hook_event_name', '')
-    # App Store version: socket lives inside the sandboxed container
     socket_path = os.path.expanduser(
-        '~/Library/Containers/fr.louisraille.Coucou/Data/Library/Application Support/NotchBuddy/nb.sock'
+        '~/Library/Containers/fr.louisraille.Coucou/Data/nb.sock'
     )
 
     if event == 'PermissionRequest':
+        # Block and wait for Coucou's decision (Claude Code allows up to 120s)
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(118)
@@ -772,14 +739,33 @@ def main():
                     break
             s.close()
             response = b''.join(chunks).decode().strip()
-            if response and 'permissionDecision' in response:
-                sys.stdout.write(response + '\\n')
-                sys.stdout.flush()
-                sys.exit(0)
+            if response:
+                try:
+                    resp_obj = json.loads(response)
+                    decision = resp_obj.get('permissionDecision', '')
+                except Exception:
+                    decision = ''
+                if decision == 'allow':
+                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow'}}}
+                    sys.stdout.write(json.dumps(out) + '\\n')
+                    sys.stdout.flush()
+                    sys.exit(0)
+                elif decision == 'always':
+                    # Let Claude Code persist the rule via updatedPermissions
+                    suggestions = payload.get('permission_suggestions', [])
+                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'allow', 'updatedPermissions': suggestions}}}
+                    sys.stdout.write(json.dumps(out) + '\\n')
+                    sys.stdout.flush()
+                    sys.exit(0)
+                elif decision == 'deny':
+                    out = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': {'behavior': 'deny', 'message': 'Denied from Coucou'}}}
+                    sys.stdout.write(json.dumps(out) + '\\n')
+                    sys.stdout.flush()
+                    sys.exit(0)
+                # 'ask' or unknown: fall through → no output → Claude Code re-asks
         except Exception:
             pass
-        sys.stdout.write('{"permissionDecision":"deny"}\\n')
-        sys.stdout.flush()
+        # App unreachable, timed out, or no explicit decision — print nothing
         sys.exit(0)
 
     try:
@@ -789,7 +775,7 @@ def main():
         s.sendall((json.dumps(payload) + '\\n').encode())
         s.close()
     except Exception:
-        pass
+        pass  # Always exit cleanly — never block Claude Code
 
 main()
 sys.exit(0)
