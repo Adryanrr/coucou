@@ -214,6 +214,21 @@ struct SettingsView: View {
                                 .textFieldStyle(.roundedBorder)
                         }
 
+                        // Orca
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack(spacing: 6) {
+                                Circle().fill(Color(hex: "#FF6B5B")).frame(width: 8, height: 8)
+                                Text("Orca").font(.system(size: 12, weight: .semibold))
+                            }
+                            TextField("Runtime JSON path (empty = auto-detect)", text: $state.orcaRuntimePath)
+                                .textFieldStyle(.roundedBorder)
+                            Text(FileManager.default.fileExists(atPath: state.orcaRuntimeFilePath)
+                                  ? "Runtime detected — polled every 5 s"
+                                  : "Not found — launch Orca.app to receive alerts")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                        }
+
                         Button("Save integrations") { saveIntegrations() }
                             .buttonStyle(.borderedProminent)
                     }
@@ -273,14 +288,14 @@ struct SettingsView: View {
 
                         Divider()
 
-                        Text("\(state.activeIntegrations.count)/4 slots used")
+                        Text("\(state.activeIntegrations.count)/\(AgentTask.maxToggleablePills) slots used")
                             .font(.system(size: 11))
-                            .foregroundColor(state.activeIntegrations.count >= 4 ? .orange : .secondary)
+                            .foregroundColor(state.activeIntegrations.count >= AgentTask.maxToggleablePills ? .orange : .secondary)
 
                         ForEach(AgentTask.toggleableIntegrationIds, id: \.self) { id in
                             let task = AgentTask.integrationAgents.first { $0.id == id }!
                             let isOn = state.activeIntegrations.contains(id)
-                            let atMax = state.activeIntegrations.count >= 4 && !isOn
+                            let atMax = state.activeIntegrations.count >= AgentTask.maxToggleablePills && !isOn
                             HStack(spacing: 8) {
                                 Circle()
                                     .fill(Color(hex: task.color))

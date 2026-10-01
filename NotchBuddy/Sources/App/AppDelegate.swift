@@ -64,6 +64,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         islandController?.showWindow(nil)
         islandController?.fsm.launch()
         HookServer.shared.start()
+        // Registry routes the approval-card buttons to the owning provider — without
+        // registration the Allow/Deny buttons are a silent no-op.
+        AgentServiceRegistry.shared.register(HookServer.shared)
+        OrcaService.shared.start()
+        AgentServiceRegistry.shared.register(OrcaService.shared)
         N8nPoller.shared.start()
         VercelPoller.shared.start()
         ResendPoller.shared.start()
