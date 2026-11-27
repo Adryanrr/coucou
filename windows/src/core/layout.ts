@@ -21,7 +21,12 @@ export type IslandViewName =
   | "result"
   | "note"
   | "settings"
-  | "greeting";
+  | "greeting"
+  | "recap"
+  | "wardrobe"
+  | "update"
+  | "whatsNew"
+  | "launch";
 
 export type BotStateName =
   | "idle"
@@ -86,11 +91,27 @@ export const VIEW_LAYOUTS: Record<IslandViewName, ViewLayout> = {
   note: { height: 160, botX: 60, botY: null, botDiameter: 50, agentMode: "column" },
   settings: { height: 160, botX: 54, botY: null, botDiameter: 46, agentMode: "none" },
   greeting: { height: 150, botX: 320, botY: 90, botDiameter: 0, agentMode: "none" },
+  // Mac: 160. The extra 24 hold the two lines with top agent, project, busiest
+  // day, longest session, permissions and questions, which the Mac card leaves
+  // to the shared image.
+  recap: { height: 184, botX: 62, botY: null, botDiameter: 58, agentMode: "column" },
+  wardrobe: { height: 160, botX: 68, botY: null, botDiameter: 58, agentMode: "none" },
+  // New version: Mochi on the left, the version and Update now (Mac: .update).
+  update: { height: 160, botX: 62, botY: null, botDiameter: 58, agentMode: "none" },
+  // After an update: what the new version brings, then "Your Coucou so far".
+  // Taller than a card, for two rows of items with their line (and, on the
+  // second step, the Botan line under the thanks).
+  whatsNew: { height: 248, botX: 62, botY: null, botDiameter: 58, agentMode: "none" },
+  // A new Claude Code session: Mochi on the left, the project and the prompt (Mac: .launch).
+  launch: { height: 160, botX: 58, botY: null, botDiameter: 52, agentMode: "none" },
 };
 
 // The upload views above are only the fallback geometry. Once a file is actually
 // dropped the whole sequence — Mochi included — is drawn by src/upload, which
 // owns its own constants (USC) straight from UploadSequenceEngine.swift.
+
+/** The question view with options to pick from: room for two rows of them. */
+export const QUESTION_PICKER_H = 200;
 
 /** Chat view grows with the conversation — IslandContainer.chatPromptHeight. */
 export function chatPromptHeight(messageCount: number): number {

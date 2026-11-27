@@ -6,10 +6,19 @@ struct NotchBuddyApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
 
     var body: some Scene {
-        // Settings are shown in an AppKit window (AppDelegate.openSettings); an accessory app
-        // has no app menu, so this scene is never reachable — it only satisfies `App`.
         Settings {
-            EmptyView()
+            SettingsView()
         }
+        #if !APPSTORE
+        .commands {
+            // ⌘, and Coucou → Settings… open the notch's pages of the Coucou window.
+            CommandGroup(replacing: .appSettings) {
+                Button(NSLocalizedString("Settings…", comment: "")) {
+                    delegate.openSettings()
+                }
+                .keyboardShortcut(",")
+            }
+        }
+        #endif
     }
 }
