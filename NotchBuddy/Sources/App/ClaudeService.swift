@@ -62,6 +62,11 @@ final class KeychainStore: @unchecked Sendable {
 
     private static let allKeys = [
         "anthropic-api-key",
+        "google-api-key",
+        "openai-api-key",
+        "deepseek-api-key",
+        "qwen-api-key",
+        "moonshot-api-key",
         "resend-api-key", "resend-from",
         "n8n-url", "n8n-api-key",
         "vercel-token",
@@ -69,6 +74,15 @@ final class KeychainStore: @unchecked Sendable {
         "stripe-api-key",
         "calcom-api-key",
         "notion-api-key",
+        "elevenlabs-api-key",
+        // WhatsApp (local gateway): its address, credentials and the webhook's signing secret
+        "whatsapp-url", "whatsapp-api-key", "whatsapp-webhook-secret",
+        // Portfolio exchange credentials
+        "portfolio-binance-key",  "portfolio-binance-secret",
+        "portfolio-okx-key",      "portfolio-okx-secret",      "portfolio-okx-passphrase",
+        "portfolio-bybit-key",    "portfolio-bybit-secret",
+        "portfolio-kraken-key",   "portfolio-kraken-secret",
+        "portfolio-coinbase-key", "portfolio-coinbase-secret",  "portfolio-coinbase-passphrase",
     ]
 
     private init() {
@@ -108,7 +122,91 @@ final class ClaudeService {
 
     private let endpoint = URL(string: "https://api.anthropic.com/v1/messages")!
     private let anthropicVersion = "2023-06-01"
-    private let model = "claude-sonnet-4-6"
+
+    // MARK: - Model list
+
+    /// Fetches available models from the Anthropic API in the order the API returns them
+    /// (newest first). Returns an empty array on any error — callers fall back to a static list.
+    static func fetchModels(apiKey: String) async -> [(id: String, label: String)] {
+        guard let url = URL(string: "https://api.anthropic.com/v1/models?limit=100") else { return [] }
+        var req = URLRequest(url: url, timeoutInterval: 10)
+        req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        guard let (data, response) = try? await URLSession.shared.data(for: req),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = json["data"] as? [[String: Any]] else { return [] }
+        return items.compactMap { item in
+            guard let id = item["id"] as? String,
+                  let name = item["display_name"] as? String else { return nil }
+            return (id: id, label: name)
+        }
+    }
+
+    /// Fetches Gemini models via the OpenAI-compatible endpoint.
+    /// Strips the "models/" prefix that the API sometimes returns and filters non-chat models.
+    static func fetchGoogleModels(apiKey: String) async -> [(id: String, label: String)] {
+        guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/openai/models") else { return [] }
+        var req = URLRequest(url: url, timeoutInterval: 10)
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        guard let (data, response) = try? await URLSession.shared.data(for: req),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = json["data"] as? [[String: Any]] else { return [] }
+        let excluded = ["embed", "imagen", "veo", "aqa", "tts", "audio", "live"]
+        return items.compactMap { item in
+            guard let raw = item["id"] as? String else { return nil }
+            let id = raw.hasPrefix("models/") ? String(raw.dropFirst(7)) : raw
+            let lower = id.lowercased()
+            guard !excluded.contains(where: { lower.contains($0) }) else { return nil }
+            return (id: id, label: id)
+        }
+    }
+
+    /// Fetches chat models from the OpenAI API, sorted newest-first by creation date.
+    /// Excludes non-chat model families.
+    static func fetchOpenAIModels(apiKey: String) async -> [(id: String, label: String)] {
+        guard let url = URL(string: "https://api.openai.com/v1/models") else { return [] }
+        var req = URLRequest(url: url, timeoutInterval: 10)
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        guard let (data, response) = try? await URLSession.shared.data(for: req),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = json["data"] as? [[String: Any]] else { return [] }
+        let excluded = ["embed", "tts", "whisper", "dall-e", "audio", "realtime", "moderat",
+                        "codex", "computer-use", "transcribe", "image", "sora",
+                        "babbage", "davinci", "instruct"]
+        return items
+            .compactMap { item -> (id: String, created: Int)? in
+                guard let id = item["id"] as? String else { return nil }
+                let lower = id.lowercased()
+                guard !excluded.contains(where: { lower.contains($0) }) else { return nil }
+                return (id: id, created: item["created"] as? Int ?? 0)
+            }
+            .sorted { $0.created > $1.created }
+            .map { (id: $0.id, label: $0.id) }
+    }
+
+    /// Fetches models from any OpenAI-compatible `/v1/models` endpoint.
+    static func fetchOpenAICompatibleModels(baseURL: String, apiKey: String) async -> [(id: String, label: String)] {
+        guard let url = URL(string: "\(baseURL)/models") else { return [] }
+        var req = URLRequest(url: url, timeoutInterval: 10)
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        guard let (data, response) = try? await URLSession.shared.data(for: req),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = json["data"] as? [[String: Any]] else { return [] }
+        return items.compactMap { item in
+            guard let id = item["id"] as? String else { return nil }
+            return (id: id, label: id)
+        }
+    }
+
+    /// Chosen in Settings; falls back to the default when the field is left empty.
+    private var model: String {
+        let m = AppState.shared.claudeModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        return m.isEmpty ? AppState.defaultClaudeModel : m
+    }
 
     var apiKey: String? { KeychainStore.shared.get("anthropic-api-key") }
 
@@ -117,14 +215,106 @@ final class ClaudeService {
 
     func clearConversation() {
         conversationMessages = []
+        #if !APPSTORE
+        relayHistory = []
+        #endif
     }
 
-    private let systemPrompt = """
-    You are Mochi, Louis's personal AI assistant embedded in the notch of his Mac. \
-    You have web search access and can help with absolutely anything — research, coding, finding places, recommendations, tasks, questions. \
-    Respond in the user's language. Be thorough and complete — use as much detail as the task requires. \
-    No markdown formatting (no **, no ##, no bullet dashes). Use plain text with line breaks.
-    """
+    /// Whether the chat can answer with Claude: an API key, or else Claude Code (GitHub build).
+    var canAnswer: Bool {
+        #if APPSTORE
+        return !(apiKey ?? "").isEmpty
+        #else
+        return !(apiKey ?? "").isEmpty || CLILocator.shared.isInstalled(.claude)
+        #endif
+    }
+
+    #if !APPSTORE
+    // MARK: - Chat through the user's subscription (CLIRelay.swift)
+
+    /// The relay's turns, as plain text: they never mix with the API's content blocks.
+    private var relayHistory: [(user: String, assistant: String)] = []
+
+    private func chatThroughSubscription(_ provider: ChatProvider, query: String, context: PromptContext?, state: AppState) async {
+        guard let cli = provider.installedCLI else {
+            let tool = provider.subscriptionCLIs.first?.displayName ?? provider.displayName
+            await showError(String(format: String(localized: "chat.subscriptions.error.missing"), tool), state: state)
+            return
+        }
+        var contextLine: String?
+        // What later turns see of this one: never a file's contents, which go out with
+        // the web search of the turns after it otherwise.
+        var historyContext: String?
+        var readDir: URL?
+        if relayHistory.isEmpty, let context {
+            switch context {
+            case .window(let app, let title, let url):
+                var text = "Context — App: \(app), Window: \(title)"
+                if let url { text += ", URL: \(url)" }
+                contextLine = text
+                historyContext = text
+            case .file(let name, let fileURL):
+                historyContext = "File: \(name)"
+                if cli == .claude, let fileURL, let dir = try? CLIRelay.isolate(fileURL) {
+                    readDir = dir
+                    contextLine = "File: \(name) (read it at \(dir.appendingPathComponent(fileURL.lastPathComponent).path))"
+                } else if let fileURL, let text = CLIRelay.inlineText(fileURL) {
+                    contextLine = "File: \(name)\nFile contents:\n\(text)"
+                } else {
+                    contextLine = "File: \(name) (its contents can't be read here)"
+                }
+            }
+        }
+        defer { if let readDir { try? FileManager.default.removeItem(at: readDir) } }
+        // A dropped file is read with no web at all: a file written to steer the model
+        // could otherwise send what it reads to a website.
+        let readsFile: Bool = {
+            if case .file = context, relayHistory.isEmpty { return true }
+            return false
+        }()
+        let request = CLIRequest(
+            model: provider == .anthropic ? model : nil,
+            system: systemPrompt + extraSystem,
+            prompt: CLIRelay.chatPrompt(history: relayHistory, context: contextLine, query: query),
+            web: !readsFile,
+            readDir: readDir,
+            noWebPolicy: nil,
+            timeout: 180
+        )
+        do {
+            let text = try await CLIRelay.ask(cli, request)
+            relayHistory.append((user: historyContext.map { "\($0)\n\n\(query)" } ?? query, assistant: text))
+            state.chatHistory.append(ChatMessage(role: .assistant, content: text))
+            state.stateOverride = nil
+            state.view = .prompt
+            NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
+        } catch {
+            await showError(error.localizedDescription, state: state)
+        }
+    }
+    #endif
+
+    /// Resolved once: NSFullUserName() is a system call, and the name cannot change under us
+    /// while the app runs.
+    private let systemPrompt = ClaudeService.makeSystemPrompt()
+    /// Added to the system prompt for this turn (the chat's Mail switch).
+    private var extraSystem = ""
+
+    /// Greets the user by their macOS first name when there is one worth using, and stays
+    /// neutral otherwise — same wording as the Windows build.
+    private nonisolated static func makeSystemPrompt() -> String {
+        let opening = if let firstName = resolveUserFirstName() {
+            "You are Mochi, \(firstName)'s personal AI assistant embedded in the notch of their Mac."
+        } else {
+            "You are Mochi, a personal AI assistant embedded in the notch of the user's Mac."
+        }
+        return """
+        \(opening) \
+        You have web search access and can help with absolutely anything — research, coding, finding places, recommendations, tasks, questions. \
+        Respond in the user's language. Be thorough and complete — use as much detail as the task requires. \
+        Use light Markdown when it helps: short paragraphs, bullet lists, **bold**, `inline code` and fenced code blocks. Avoid tables and big headings: the chat window is small.
+        """
+    }
 
     private let webSearchTools: [[String: Any]] = [
         ["type": "web_search_20250305", "name": "web_search", "max_uses": 5]
@@ -133,6 +323,34 @@ final class ClaudeService {
     // MARK: - Chat (multi-turn, natural text + web search)
 
     func chat(query: String, context: PromptContext?, state: AppState) async {
+        if DemoEngine.shared.isActive {
+            state.stateOverride = .thinking
+            await DemoEngine.shared.streamChatResponse(for: query)
+            state.stateOverride = nil
+            return
+        }
+        var query = query
+        extraSystem = ""
+        #if !APPSTORE
+        // Mail on: the AI gets the latest messages under the request, and may answer with a
+        // plan of actions (MailPlan.swift) that runs only after the user's click.
+        if state.chatMailMode {
+            query = await MailAgent.shared.decorate(query)
+            extraSystem = MailAgentPrompt.instructions
+        }
+        #endif
+        #if !APPSTORE
+        // "Use my subscription": the provider's own terminal tool answers, signed in with
+        // the user's account.
+        if state.usesSubscription(state.chatProvider) {
+            await chatThroughSubscription(state.chatProvider, query: query, context: context, state: state)
+            return
+        }
+        #endif
+        guard state.chatProvider == .anthropic else {
+            await chatOpenAICompatible(query: query, context: context, state: state)
+            return
+        }
         guard let key = apiKey, !key.isEmpty else {
             await showError("API key missing. Open settings.", state: state)
             return
@@ -163,7 +381,7 @@ final class ClaudeService {
             "model": model,
             "max_tokens": 4096,
             "tools": webSearchTools,
-            "system": systemPrompt,
+            "system": systemPrompt + extraSystem,
             "messages": conversationMessages,
         ]
 
@@ -172,7 +390,197 @@ final class ClaudeService {
             await handleChatResult(data, state: state)
         } catch {
             conversationMessages.removeLast()
-            await showError("Network error: \(error.localizedDescription)", state: state)
+            await showError(error.localizedDescription, state: state)
+        }
+    }
+
+    // MARK: - OpenAI-compatible chat (Google Gemini / OpenAI / Ollama / LM Studio)
+
+    func chatOpenAICompatible(query: String, context: PromptContext?, state: AppState) async {
+        let provider = state.chatProvider
+        guard provider != .anthropic else { return }
+
+        let baseURL: String
+        if provider == .ollama {
+            baseURL = LocalChat.normaliseURL(state.ollamaServerURL)
+        } else if provider == .lmstudio {
+            baseURL = LocalChat.normaliseURL(state.lmstudioServerURL)
+        } else {
+            switch provider {
+            case .google:    baseURL = "https://generativelanguage.googleapis.com/v1beta/openai"
+            case .openai:    baseURL = "https://api.openai.com/v1"
+            case .deepseek:  baseURL = "https://api.deepseek.com/v1"
+            case .qwen:      baseURL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            case .moonshot:  baseURL = "https://api.moonshot.cn/v1"
+            case .anthropic, .ollama, .lmstudio, .cursor, .copilot: baseURL = ""
+            }
+        }
+
+        guard !baseURL.isEmpty else {
+            if provider.isLocal {
+                let name = provider == .ollama ? "Ollama" : "LM Studio"
+                await showError("Connect \(name) in Settings → Chat first.", state: state)
+            }
+            return
+        }
+        guard let url = URL(string: "\(baseURL)/chat/completions") else { return }
+
+        // Auth header
+        let authHeader: String
+        let cloudKey: String?   // the provider's own key, sent when streaming too
+        if provider.isLocal {
+            authHeader = "Bearer ollama"
+            cloudKey = nil
+        } else {
+            guard let key = KeychainStore.shared.get(provider.keychainKey), !key.isEmpty else {
+                await showError("\(provider.displayName) API key missing. Configure it in Settings.", state: state)
+                return
+            }
+            authHeader = "Bearer \(key)"
+            cloudKey = key
+        }
+
+        // Build messages
+        var msgs: [[String: Any]] = [["role": "system", "content": systemPrompt + extraSystem]]
+        for m in conversationMessages {
+            var simplified = m
+            if let content = m["content"] as? [[String: Any]],
+               let textBlock = content.first(where: { ($0["type"] as? String) == "text" }),
+               let text = textBlock["text"] as? String {
+                simplified["content"] = text
+            }
+            msgs.append(simplified)
+        }
+        var userText = query
+        if conversationMessages.isEmpty, let ctx = context {
+            switch ctx {
+            case .window(let app, let title, let url):
+                var prefix = "Context — App: \(app), Window: \(title)"
+                if let u = url { prefix += ", URL: \(u)" }
+                userText = prefix + "\n\n" + query
+            case .file(let name, let fileURL):
+                if provider.isLocal, let fileURL = fileURL {
+                    let ext = fileURL.pathExtension.lowercased()
+                    let binaryExts = ["pdf", "jpg", "jpeg", "png", "gif", "webp"]
+                    if !binaryExts.contains(ext),
+                       let text = try? String(contentsOf: fileURL, encoding: .utf8), !text.isEmpty {
+                        let truncated = text.count > 24_000
+                            ? String(text.prefix(24_000)) + "\n[truncated]"
+                            : text
+                        userText = "File: \(name)\n\n\(truncated)\n\n" + query
+                    } else {
+                        userText = "File: \(name)\n\n" + query
+                    }
+                } else {
+                    userText = "File: \(name)\n\n" + query
+                }
+            }
+        }
+        msgs.append(["role": "user", "content": userText])
+        conversationMessages.append(["role": "user", "content": userText])
+
+        let useStream = provider.isLocal || provider == .deepseek || provider == .qwen || provider == .moonshot
+        var body: [String: Any] = [
+            "model": state.activeChatModel,
+            "max_tokens": 4096,
+            "messages": msgs,
+        ]
+        if useStream { body["stream"] = true }
+
+        var req = URLRequest(url: url, timeoutInterval: useStream ? 120 : 30)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(authHeader, forHTTPHeaderField: "Authorization")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        if useStream {
+            // Add placeholder (hidden until first token via ChatBubble empty-content guard)
+            let placeholder = ChatMessage(role: .assistant, content: "")
+            let msgId = placeholder.id
+            state.chatHistory.append(placeholder)
+            state.stateOverride = .thinking
+            let modelCopy = state.activeChatModel
+            let streamBody: [String: Any] = [
+                "model": modelCopy,
+                "messages": msgs,
+                "stream": true,
+                "max_tokens": 4096,
+            ]
+            let encodedBody = (try? JSONSerialization.data(withJSONObject: streamBody)) ?? Data()
+            do {
+                let final = try await LocalChat.streamChat(
+                    baseURL: baseURL,
+                    encodedBody: encodedBody,
+                    model: modelCopy,
+                    apiKey: cloudKey
+                ) { [state, msgId] visible in
+                    if !visible.isEmpty, state.stateOverride == .thinking {
+                        state.stateOverride = nil   // hide typing dots on first visible text
+                    }
+                    if let idx = state.chatHistory.firstIndex(where: { $0.id == msgId }) {
+                        state.chatHistory[idx].content = visible
+                    }
+                }
+                conversationMessages.append(["role": "assistant", "content": final])
+                if let idx = state.chatHistory.firstIndex(where: { $0.id == msgId }) {
+                    state.chatHistory[idx].content = final
+                }
+                state.stateOverride = nil
+                state.view = .prompt
+                NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
+            } catch let e as LocalChatError {
+                conversationMessages.removeLast()
+                state.chatHistory.removeAll { $0.id == msgId }
+                state.stateOverride = nil
+                let msg: String
+                switch e {
+                case .serverUnreachable:
+                    if provider == .ollama {
+                        msg = "Ollama isn't running. Open it, then ask again."
+                    } else if provider == .lmstudio {
+                        msg = "Start the local server in LM Studio, then ask again."
+                    } else {
+                        msg = "\(provider.displayName) is unreachable. Check your connection and API key."
+                    }
+                case .modelNotFound(let m):
+                    msg = "\(m) isn't installed. Pick another model above the chat box."
+                case .serverError(let s):
+                    msg = s
+                }
+                await showError(msg, state: state)
+            } catch {
+                conversationMessages.removeLast()
+                state.chatHistory.removeAll { $0.id == msgId }
+                state.stateOverride = nil
+                await showError(error.localizedDescription, state: state)
+            }
+        } else {
+            // Non-streaming (Google, OpenAI)
+            do {
+                let (data, response) = try await URLSession.shared.data(for: req)
+                guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+                    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let err = (json["error"] as? [String: Any])?["message"] as? String {
+                        throw NSError(domain: "ChatAPI", code: 0, userInfo: [NSLocalizedDescriptionKey: err])
+                    }
+                    throw NSError(domain: "ChatAPI", code: 0, userInfo: [NSLocalizedDescriptionKey: "HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)"])
+                }
+                guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let choices = json["choices"] as? [[String: Any]],
+                      let message = choices.first?["message"] as? [String: Any],
+                      let content = message["content"] as? String else {
+                    throw NSError(domain: "ChatAPI", code: 0, userInfo: [NSLocalizedDescriptionKey: "Unexpected response format"])
+                }
+                let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                conversationMessages.append(["role": "assistant", "content": trimmed])
+                state.chatHistory.append(ChatMessage(role: .assistant, content: trimmed))
+                state.stateOverride = nil
+                state.view = .prompt
+                NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
+            } catch {
+                conversationMessages.removeLast()
+                await showError(error.localizedDescription, state: state)
+            }
         }
     }
 
@@ -223,9 +631,96 @@ final class ClaudeService {
             let result = try await callAPI(body: body, key: key, beta: "web-search-2025-03-05")
             await handleResult(result, state: state)
         } catch {
-            await showError("Network error: \(error.localizedDescription)", state: state)
+            await showError(error.localizedDescription, state: state)
         }
     }
+
+    #if !APPSTORE
+    // MARK: - Voice brain turn (Claude with Coucou's tools)
+
+    /// One Messages API call for the voice brain: returns the assistant content blocks and
+    /// the stop reason. The fast model first, the Settings model if the key can't use it.
+    func voiceTurn(system: String, messages: [[String: Any]], tools: [[String: Any]])
+        async -> (content: [[String: Any]], stopReason: String)? {
+        guard let key = apiKey, !key.isEmpty else { return nil }
+        func body(_ model: String) -> [String: Any] {
+            ["model": model, "max_tokens": 2048, "system": system, "tools": tools, "messages": messages]
+        }
+        let data: Data
+        do {
+            data = try await callAPI(body: body(Self.voiceModel), key: key, beta: "web-search-2025-03-05")
+        } catch {
+            guard let retry = try? await callAPI(body: body(model), key: key, beta: "web-search-2025-03-05") else {
+                appendAppLog("nb.log", "[Voice] Claude turn failed: \(error.localizedDescription)")
+                return nil
+            }
+            data = retry
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = json["content"] as? [[String: Any]] else { return nil }
+        return (content, json["stop_reason"] as? String ?? "end_turn")
+    }
+
+    // MARK: - Voice answer (Coucou's voice, web search)
+
+    /// Fast model for spoken answers; the chat model from Settings when it is unavailable.
+    private static let voiceModel = "claude-haiku-4-5"
+
+    /// A short answer Coucou can say aloud, with web search, in the answer language.
+    /// `history` holds the previous exchanges of this voice conversation (memory only).
+    /// nil on any failure: no key, network, quota.
+    func voiceAnswer(_ question: String, history: [VoiceWebTurn], french: Bool) async -> String? {
+        guard let key = apiKey, !key.isEmpty else { return nil }
+        let today = Date().formatted(.dateTime.weekday(.wide).day().month(.wide).year()
+            .locale(Locale(identifier: french ? "fr_FR" : "en_US")))
+        let system = french
+            ? """
+              Tu es Coucou, un assistant vocal dans le notch du Mac. Nous sommes le \(today). \
+              Ta réponse est lue à voix haute : 2 à 4 phrases courtes, en français, sans markdown, sans liste, \
+              sans lien, sans citer tes sources. Cherche sur le web dès que la réponse peut avoir changé \
+              (actualité, résultats, prix, horaires, météo, personnes). Donne directement les faits utiles. \
+              S'il y a clairement plus à raconter, termine par une seule courte question pour proposer la suite.
+              """
+            : """
+              You are Coucou, a voice assistant in the Mac's notch. Today is \(today). \
+              Your answer is read aloud: 2 to 4 short sentences in English, no markdown, no lists, no links, \
+              never cite sources. Search the web whenever the answer may have changed (news, scores, prices, \
+              opening hours, weather, people). Give the useful facts straight away. \
+              When there is clearly more worth telling, end with one short question offering to go on.
+              """
+        var messages: [[String: Any]] = []
+        for turn in history {
+            messages.append(["role": "user", "content": turn.question])
+            messages.append(["role": "assistant", "content": turn.answer])
+        }
+        messages.append(["role": "user", "content": question])
+
+        var search: [String: Any] = ["type": "web_search_20250305", "name": "web_search", "max_uses": 3]
+        var location: [String: Any] = ["type": "approximate", "timezone": TimeZone.current.identifier]
+        if let country = Locale.current.region?.identifier, country.count == 2 { location["country"] = country }
+        search["user_location"] = location
+
+        func body(_ model: String) -> [String: Any] {
+            ["model": model, "max_tokens": 700, "system": system, "tools": [search], "messages": messages]
+        }
+        let data: Data
+        do {
+            data = try await callAPI(body: body(Self.voiceModel), key: key, beta: "web-search-2025-03-05")
+        } catch {
+            // The fast model is not available to this key: the Settings model instead.
+            guard let retry = try? await callAPI(body: body(model), key: key, beta: "web-search-2025-03-05") else {
+                appendAppLog("nb.log", "[Voice] web answer failed")
+                return nil
+            }
+            data = retry
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = json["content"] as? [[String: Any]],
+              let text = claudeResponseText(fromContent: content) else { return nil }
+        let spoken = VoiceQuery.spokenText(text)
+        return spoken.isEmpty ? nil : spoken
+    }
+    #endif
 
     // MARK: - API call
 
@@ -242,6 +737,20 @@ final class ClaudeService {
         let (data, response) = try await URLSession.shared.data(for: request)
 
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            // Parse Anthropic error format: {"type":"error","error":{"type":"…","message":"…"}}
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let err = json["error"] as? [String: Any],
+               let errType = err["type"] as? String,
+               let errMsg = err["message"] as? String {
+                if errType == "not_found_error" {
+                    let id = AppState.shared.claudeModel
+                    throw NSError(domain: "Claude", code: 0,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "Model not found: \(id). Pick another one in Settings."])
+                }
+                throw NSError(domain: "Claude", code: 0,
+                    userInfo: [NSLocalizedDescriptionKey: errMsg])
+            }
             let msg = String(data: data, encoding: .utf8) ?? "unknown error"
             throw NSError(domain: "Claude", code: 0, userInfo: [NSLocalizedDescriptionKey: msg])
         }
@@ -260,14 +769,13 @@ final class ClaudeService {
         // Store full content (includes tool_use/tool_result blocks) for correct multi-turn context
         conversationMessages.append(["role": "assistant", "content": content])
 
-        guard let textBlock = content.first(where: { $0["type"] as? String == "text" }),
-              let text = textBlock["text"] as? String, !text.isEmpty else {
+        guard let text = claudeResponseText(fromContent: content) else {
             await showError("No response text.", state: state)
             return
         }
 
         // Add to display history
-        state.chatHistory.append(ChatMessage(role: .assistant, content: text.trimmingCharacters(in: .whitespacesAndNewlines)))
+        state.chatHistory.append(ChatMessage(role: .assistant, content: text))
 
         state.stateOverride = nil
         state.view = .prompt
@@ -280,8 +788,7 @@ final class ClaudeService {
         // Extract text from Anthropic response (may contain tool_use / web_search_tool_result blocks)
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let content = json["content"] as? [[String: Any]],
-              let textBlock = content.first(where: { $0["type"] as? String == "text" }),
-              let text = textBlock["text"] as? String else {
+              let text = claudeResponseText(fromContent: content) else {
             await showError("Unexpected API response.", state: state)
             return
         }

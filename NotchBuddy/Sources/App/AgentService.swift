@@ -2,12 +2,12 @@ import Foundation
 
 // MARK: - AgentService
 //
-// Abstraction over a local agent environment (Claude Code via hooks, OpenCode via its
-// HTTP/SSE API, …). A service owns its transport and the provider-specific payload
-// parsing, then emits normalized AgentEvent values.
+// Abstraction for a local agent that is not a Coucou hook. Orca is the implementation.
+// Claude Code, Codex and the other hook agents stay in HookServer: that path owns the
+// approval queue, the phone relay and each agent's reply format.
 //
-// Island state (pill, bot, ticker, badges, sounds, approval card) is only mutated by
-// AgentEventRouter, so every provider drives the UI the same way.
+// A service owns its transport and parsing, then emits AgentEvent values. AgentEventRouter
+// is the only place those events touch the island (pill, ticker, badges, sounds, card).
 
 // MARK: - Approval
 
@@ -206,7 +206,9 @@ final class AgentEventRouter {
             state.updateTask(id: id, state: .approval)
             state.pendingApproval = ApprovalInfo(sessionId: request.sessionID,
                                                  tool: request.tool,
-                                                 command: request.command)
+                                                 command: request.command,
+                                                 inputKey: "",
+                                                 pillId: id)
             state.isPinned = true
             SoundEngine.shared.play("approval")
             // Approval always forces the island open — user must be able to respond
@@ -214,6 +216,8 @@ final class AgentEventRouter {
             expandIfNeeded(to: .approval)
 
         case .permissionResolved:
+            // A hook agent's card is owned by HookServer. Never clear that one from here.
+            guard state.pendingApproval?.pillId == id else { return true }
             state.pendingApproval = nil
             state.isPinned = false
             state.updateTask(id: id, state: .working)

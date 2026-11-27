@@ -3,44 +3,95 @@
 // the pill isn't focused, plays a sound, and clears itself after 60 s.
 
 import { onEvent, Bridge, type IntegrationUpdate } from "../core/bridge";
+import { gitHubAlert, type GitHubEvent } from "../core/github";
+import { availablePills } from "../core/pills";
 import { Sound } from "../core/sound";
 import { State } from "../core/state";
 import type { Island } from "./island";
 
-/** Which Credential Manager key backs each pill. */
-const KEY_FOR: Record<string, string> = {
-  integration_stripe: "stripe-api-key",
-  integration_github: "github-token",
-  integration_vercel: "vercel-token",
-  integration_n8n: "n8n-api-key",
-  integration_resend: "resend-api-key",
-  integration_notion: "notion-api-key",
-  integration_calcom: "calcom-api-key",
-};
+const GITHUB = "integration_github";
 
 const clearTimers = new Map<string, number>();
 
 export function registerIntegrationHandlers(island: Island) {
-  void onEvent<IntegrationUpdate>("integration", (update) => handle(island, update));
+  void onEvent<IntegrationUpdate>("integration", (update) => handleIntegrationUpdate(island, update));
+  void onEvent<GitHubEvent[]>("github-alerts", handleGitHubAlerts);
+  void onEvent<string>("secrets-changed", () => void refreshConfigured());
   void refreshConfigured();
+  State.subscribe(refreshGitHubWhenShown);
 }
 
-/** Asks Rust which keys exist so the idle cards can say so. */
-export async function refreshConfigured() {
-  for (const [id, key] of Object.entries(KEY_FOR)) {
-    const present = (await Bridge.secretPresent(key)) ?? false;
-    const info = State.integrations[id] ?? { data: {}, error: null, loaded: false, configured: false };
-    State.integrations[id] = { ...info, configured: present };
-  }
-  const hooks = State.settings.hooksInstalled;
-  const claude = State.integrations.integration_claude ?? {
-    data: {}, error: null, loaded: false, configured: false,
-  };
-  State.integrations.integration_claude = { ...claude, configured: hooks };
+/**
+ * AppState.handleGitHubEvents: the loudest event sets the badge — only while the
+ * GitHub pill isn't the one on screen — and plays its sound. Unlike the other
+ * integrations it leaves Mochi's state alone and the badge stays until the pill
+ * is focused, as on macOS.
+ */
+export function handleGitHubAlerts(events: GitHubEvent[]) {
+  if (State.paused) return;
+  const alert = gitHubAlert(events);
+  if (!alert) return;
+  const task = State.tasks.find((t) => t.id === GITHUB);
+  if (!task) return;
+  if (State.focusId !== GITHUB) task.pillBadge = alert.badge;
+  Sound.play(alert.sound);
   State.notify();
 }
 
-function handle(island: Island, update: IntegrationUpdate) {
+let gitHubShown = false;
+
+/** The GitHub card just came on screen (focused, island opened): refresh it if stale. */
+function refreshGitHubWhenShown() {
+  const shown = State.mode === "expanded" && State.focusTask?.id === GITHUB;
+  if (shown && !gitHubShown) void Bridge.githubRefresh("pulse");
+  gitHubShown = shown;
+}
+
+/**
+ * Whether each pill is connected, so its idle card can say so: a key in the
+ * credential store for a service or a chat provider, the hooks in place for a
+ * pill fed by hook events (Mac #183), nothing at all for Claude Desktop.
+ */
+export async function refreshConfigured() {
+  const hooks = (await Bridge.agentHooksStatus()) ?? null;
+  for (const def of availablePills(State.os)) {
+    let configured: boolean;
+    switch (def.connect.kind) {
+      case "key":
+        configured = (await Bridge.keyReady(def.connect.key)) ?? false;
+        break;
+      case "hooks":
+        // Without an answer from Rust (a plain browser), the Claude Code pill
+        // falls back to what the settings say about its hooks.
+        configured = hooks?.[def.id] ??
+          (def.id === "integration_claude" ? State.settings.hooksInstalled : false);
+        break;
+      case "server":
+        // A local model server counts once the chat is connected to it.
+        configured = State.settings[def.connect.field] !== "";
+        break;
+      case "none":
+        configured = true;
+        break;
+    }
+    const info = State.integrations[def.id] ?? { data: {}, error: null, loaded: false, configured: false };
+    State.integrations[def.id] = { ...info, configured };
+  }
+  State.notify();
+}
+
+/** Only the hook-driven pills, for when the island opens: a few small file reads. */
+export async function refreshHookPills() {
+  const hooks = await Bridge.agentHooksStatus();
+  if (!hooks) return;
+  for (const [id, present] of Object.entries(hooks)) {
+    const info = State.integrations[id] ?? { data: {}, error: null, loaded: false, configured: false };
+    State.integrations[id] = { ...info, configured: present };
+  }
+  State.notify();
+}
+
+export function handleIntegrationUpdate(island: Pick<Island, "reveal">, update: IntegrationUpdate) {
   if (State.paused) return;
 
   const previous = State.integrations[update.id];
@@ -48,7 +99,7 @@ function handle(island: Island, update: IntegrationUpdate) {
     data: update.error ? (previous?.data ?? {}) : update.data,
     error: update.error,
     loaded: update.error ? (previous?.loaded ?? false) : true,
-    configured: previous?.configured ?? true,
+    configured: true,
   };
 
   const event = update.event;

@@ -39,7 +39,7 @@ final class OrcaService: @unchecked Sendable {
     // (conformance declared in the extension below — declaring it on the class would
     // make Swift isolate the whole type to the main actor; socket I/O runs on threads)
 
-    let taskID = "integration_orca"
+    let taskID = "agent_orca"
     let source: AgentSource = .orca
 
     /// Only while the card on screen is Orca's — a Claude Code card shown on top must keep
@@ -187,7 +187,7 @@ final class OrcaService: @unchecked Sendable {
             if missCount >= 3, pendingApprovals.isEmpty == false {
                 pendingApprovals.removeAll()
                 if isOrcaCardShown {
-                    AgentEventRouter.shared.handle(AgentEvent(taskID: taskID, kind: .permissionResolved(.allow)))
+                    AgentEventRouter.shared.handle(AgentEvent(taskID: taskID, kind: .permissionResolved(.ask)))
                 }
             }
             return
@@ -238,7 +238,7 @@ final class OrcaService: @unchecked Sendable {
             if pendingApprovals.isEmpty {
                 if isOrcaCardShown {
                     pendingApprovals.removeAll()
-                    AgentEventRouter.shared.handle(AgentEvent(taskID: taskID, kind: .permissionResolved(.allow)))
+                    AgentEventRouter.shared.handle(AgentEvent(taskID: taskID, kind: .permissionResolved(.ask)))
                 }
             } else if isOrcaCardShown, let still = rows.first(where: { stillPending.contains($0.id) }) {
                 // The row shown in the card resolved, but another one still waits: repoint.
@@ -327,8 +327,10 @@ final class OrcaService: @unchecked Sendable {
         let state = AppState.shared
         guard let idx = state.tasks.firstIndex(where: { $0.id == taskID }) else { return }
         if state.tasks[idx].steps != steps {
-            state.tasks[idx].steps = steps
-            state.tasks[idx].stepIndex = max(steps.count - 1, 0)
+            var task = state.tasks[idx]
+            task.steps = steps
+            task.stepIndex = max(steps.count - 1, 0)
+            state.tasks[idx] = task
         }
     }
 
