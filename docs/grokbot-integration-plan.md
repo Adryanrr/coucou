@@ -6,14 +6,12 @@ Escrito em 27 de novembro de 2026 contra o `main` do upstream
 [Louis-CFM/coucou](https://github.com/Louis-CFM/coucou) em
 `202082ee0204bbc4fb78d8178cea3f0c6fcc34e4` (« Homebrew cask: 0.6.2 »,
 24 de novembro de 2026). Os caminhos de código abaixo são os desse
-commit. O `main` do fork Adryanrr/coucou **não** foi avançado até lá:
-o fast-forward é impossível (ver « Baseline do fork »). Três commits
-locais (abstração `AgentService`, Orca, abas de ajustes e pt-BR) não
-existem no upstream, e o upstream substituiu essa época por
-`PillCatalog` + roteamento em `HookServer`. A implementação deve
-seguir o upstream, depois que o fork for sincronizado de verdade.
-Não reaproveitar `OrcaService` como modelo de RPC: o Grok Bot não
-documenta um socket local equivalente.
+commit, já presentes neste branch porque ele está em cima do merge
+do PR de sync (fork `main` ainda não recebeu esse merge). O upstream
+substituiu a época antiga do fork por `PillCatalog` + roteamento em
+`HookServer`. O Orca foi reencaixado ao lado disso (`agent_orca`,
+`OrcaService` → `AgentEventRouter`). Não usar esse socket como modelo
+para o Grok Bot: o Grok Bot não documenta um RPC local equivalente.
 
 ## Objetivo
 
@@ -39,13 +37,16 @@ canal estável que devolva a decisão ao Grok Bot.
 | Data | 1 out 2026 | 24 nov 2026 |
 | Em relação ao merge-base `835421c` | 3 commits | 1177 commits |
 
-O merge-base é ancestral dos dois, então nenhum lado contém o outro.
-`git merge-tree` entre os dois `main` acusa 9 conflitos
-(`project.pbxproj`, `Localizable.xcstrings`, `AppDelegate.swift`,
-`AppState.swift`, `HookServer.swift`, `IslandTypes.swift`
-modify/delete, `IslandViewContent.swift`, `SettingsView.swift`,
-`project.yml`). Um merge não compilaria sem uma porta manual. Não
-houve force-push nem merge no `main` do fork.
+Esse desencontro é o que o PR de sync resolve, sem force-push no
+`main`. O merge não era limpo: 9 conflitos (`project.pbxproj`,
+`Localizable.xcstrings`, `AppDelegate.swift`, `AppState.swift`,
+`HookServer.swift`, `IslandTypes.swift` modify/delete,
+`IslandViewContent.swift`, `SettingsView.swift`, `project.yml`).
+A resolução ficou com a arquitetura do upstream. As abas
+`NSTabViewController` e o `AppLanguage` saíram, porque o hub de
+ajustes e o catálogo de 16 línguas (pt-BR inclusive) já existem. O
+teto de pills continua 4, e a pill Orca começa desligada. Este
+documento está nesse resultado, não no `main` antigo do fork.
 
 ## Como o Coucou integra agentes hoje
 
@@ -361,9 +362,9 @@ do Grok Bot.
    está documentada.
 5. Vale a pena uma pill que só abre o app, dado que o Grok Bot já
    mostra banner e, minutos depois, notifica o iPhone dele?
-6. O fork deve ser sincronizado (resolvendo os 9 conflitos, ou
-   reaplicando Orca/pt-BR em cima do upstream) antes de qualquer
-   código desta integração?
+6. O código desta integração espera o merge do PR de sync no `main`
+   do fork. Até lá, a base deste plano é o branch desse PR, não o
+   `main` de 1 out 2026.
 
 ## Riscos
 
@@ -383,11 +384,9 @@ do Grok Bot.
   o app dele duplica a Lock Screen.
 - **CPU.** `NSWorkspace` por notificação cabe na regra dos 0 %. Um
   poll de diretório não cabe com a island escondida.
-- **Fork dessincronizado.** Implementar em cima do `main` atual do
-  fork mexe em `AgentService` / `OrcaService`, que o upstream não
-  tem. Implementar em cima do upstream perde Orca e as abas pt-BR até
-  alguém reaplicar esses 3 commits. As duas opções são uma decisão
-  do dono do fork, não parte desta integração.
+- **Base.** Implementar a fase 1 no `main` de 1 out 2026 mexe numa
+  árvore que o sync substitui. O lugar certo é o resultado do PR de
+  sync, onde `PillCatalog`, `HookServer` e o Orca já convivem.
 - **App Store.** Pill `githubOnly` evita levar um scheme de terceiro
   e uma integração sem API estável para a review. O build da App
   Store não ganha a pill na fase 1.
