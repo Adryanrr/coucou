@@ -40,7 +40,7 @@ final class OrcaService: @unchecked Sendable {
     // make Swift isolate the whole type to the main actor; socket I/O runs on threads)
 
     let taskID = "agent_orca"
-    let source: AgentSource = .orca
+    let source: AgentSource = .agent
 
     /// Only while the card on screen is Orca's — a Claude Code card shown on top must keep
     /// routing its Allow/Deny to HookServer.
